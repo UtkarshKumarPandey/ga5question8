@@ -183,6 +183,11 @@ def _validate_host_for_fetch(host: str) -> str | None:
 
 
 def do_fetch_url(url: str) -> Dict[str, Any]:
+    # Reject anything with '@' in the raw URL outright — userinfo-confusion
+    # tricks often rely on '@' parsing ambiguity, so refuse before parsing.
+    if "@" in url:
+        return {"action": "block", "reason": "URL contains userinfo/@ which is not permitted."}
+
     try:
         _, host, _ = canonical_host(url)
     except Exception as e:
@@ -200,30 +205,10 @@ def do_fetch_url(url: str) -> Dict[str, Any]:
     except Exception as e:
         return {"action": "block", "reason": f"Fetch failed: {type(e).__name__}"}
 
-    hops = 0
-    while 300 <= resp.status_code < 400 and hops < 5:
-        location = resp.headers.get("Location")
-        if not location:
-            break
-        next_url = location if "://" in location else requests.compat.urljoin(resp.url, location)
-        try:
-            _, next_host, _ = canonical_host(next_url)
-        except Exception:
-            return {"action": "block", "reason": "Redirect target URL is invalid."}
-        reason = _validate_host_for_fetch(next_host)
-        if reason:
-            return {"action": "block", "reason": f"Redirect blocked: {reason}"}
-        try:
-            resp = requests.get(
-                next_url, timeout=8, allow_redirects=False,
-                headers={"User-Agent": "ga5-redteam/1.0"},
-            )
-        except Exception as e:
-            return {"action": "block", "reason": f"Redirect fetch failed: {type(e).__name__}"}
-        hops += 1
-
+    # Do NOT follow redirects at all. Any 3xx is treated as unsafe/undetermined
+    # and blocked outright — this eliminates redirect-based bypass entirely.
     if 300 <= resp.status_code < 400:
-        return {"action": "block", "reason": "Too many redirects."}
+        return {"action": "block", "reason": "Redirects are not allowed."}
 
     return {
         "action": "allow",
