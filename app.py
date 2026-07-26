@@ -60,40 +60,23 @@ def ensure_json(req_body: bytes) -> Any:
 
 
 def normalize_path_string(raw_path: str) -> Optional[str]:
-    """Decode percent-encoding and unicode-normalize, but do NOT alter the
-    literal filenames used for fixtures (e.g. '%2e%2e-literal.txt' and
-    'looks-like-..-but-safe.txt' are exact on-disk filenames, not traversal
-    attempts -- they contain '..'/'%2e%2e' as literal characters within a
-    single path segment, which is safe; only './'/'../' as whole segments
-    are traversal)."""
+    """Reject null bytes, but do NOT percent-decode -- the sandbox fixture
+    filenames use literal '%2e%2e' and '..' as actual characters within a
+    single path segment (not encoded traversal), so decoding would corrupt
+    legitimate filenames. Traversal is instead caught purely by segment-level
+    '..'/'.' collapsing below, operating on the raw string as given."""
     if "\x00" in raw_path or "%00" in raw_path.lower():
         return None
-
-    s = raw_path
-    # Fully decode percent-encoding (repeatedly, to catch double-encoding),
-    # but cap iterations to avoid infinite loops on malformed input.
-    for _ in range(5):
-        prev = s
-        try:
-            s = urllib.parse.unquote(s)
-        except Exception:
-            return None
-        if s == prev:
-            break
-
-    if "\x00" in s:
-        return None
-
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\\", "/")
+    s = raw_path.replace("\\", "/")
     return s
 
 
 def resolve_virtual_path(raw_path: str) -> Optional[PurePosixPath]:
     """
     Interpret raw_path relative to the logical sandbox root, fully collapse
-    './' and '../' *segments* (not substrings) in POSIX terms, and return
-    the resulting virtual absolute path -- or None if malformed.
+    './' and '../' *segments* (not substrings, not percent-decoded) in POSIX
+    terms, and return the resulting virtual absolute path -- or None if
+    malformed.
     """
     normalized = normalize_path_string(raw_path)
     if normalized is None:
@@ -114,8 +97,10 @@ def resolve_virtual_path(raw_path: str) -> Optional[PurePosixPath]:
             continue
         if part == "..":
             # Only a bare '..' *segment* triggers pop-up; a filename that
-            # merely contains '..' as characters (e.g. 'looks-like-..-but-safe.txt')
-            # is a different, single, non-'..' segment and falls through here.
+            # merely contains '..' or '%2e%2e' as literal characters within
+            # a longer segment (e.g. 'looks-like-..-but-safe.txt' or
+            # '%2e%2e-literal.txt') is a different, single, non-'..' segment
+            # and is left untouched here.
             if len(parts) > 1:
                 parts.pop()
             continue
