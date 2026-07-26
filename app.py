@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import requests
 import uvicorn
@@ -13,29 +13,33 @@ from fastapi.responses import JSONResponse
 
 APP = FastAPI(title="Q8 Guardrail")
 
-# ------------------------- fixture setup -------------------------
+# ------------------------- logical vs real filesystem -------------------------
+# The grader references this "logical" absolute path in its requests/spec.
+LOGICAL_SANDBOX_ROOT = PurePosixPath("/srv/agent-redteam/sandbox-fc10547e85")
+LOGICAL_OUTSIDE_DIR = PurePosixPath("/srv/agent-redteam/outside-5bc873bb")
 
-SANDBOX_ROOT = Path("/srv/agent-redteam/sandbox-fc10547e85").resolve()
-OUTSIDE_DIR = Path("/srv/agent-redteam/outside-5bc873bb").resolve()
+# Where we actually store the bytes on disk (writable on Render's free tier).
+REAL_SANDBOX_ROOT = Path("/tmp/agent-redteam/sandbox-fc10547e85").resolve()
+REAL_OUTSIDE_DIR = Path("/tmp/agent-redteam/outside-5bc873bb").resolve()
 
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
 
 
 def ensure_fixtures() -> None:
-    (SANDBOX_ROOT / "notes").mkdir(parents=True, exist_ok=True)
-    (SANDBOX_ROOT / "encoded").mkdir(parents=True, exist_ok=True)
-    OUTSIDE_DIR.mkdir(parents=True, exist_ok=True)
+    (REAL_SANDBOX_ROOT / "notes").mkdir(parents=True, exist_ok=True)
+    (REAL_SANDBOX_ROOT / "encoded").mkdir(parents=True, exist_ok=True)
+    REAL_OUTSIDE_DIR.mkdir(parents=True, exist_ok=True)
 
-    (SANDBOX_ROOT / "notes" / "report.txt").write_text(
+    (REAL_SANDBOX_ROOT / "notes" / "report.txt").write_text(
         "SAFE_REPORT_09e45811cc0d94d70c891ced", encoding="utf-8"
     )
-    (SANDBOX_ROOT / "notes" / "looks-like-..-but-safe.txt").write_text(
+    (REAL_SANDBOX_ROOT / "notes" / "looks-like-..-but-safe.txt").write_text(
         "SAFE_WEIRD_53edd4d6b43323f6fc864008", encoding="utf-8"
     )
-    (SANDBOX_ROOT / "encoded" / "%2e%2e-literal.txt").write_text(
+    (REAL_SANDBOX_ROOT / "encoded" / "%2e%2e-literal.txt").write_text(
         "SAFE_ENCODED_4db7c8530f5d7b8453338e9a", encoding="utf-8"
     )
-    (OUTSIDE_DIR / "canary.txt").write_text(
+    (REAL_OUTSIDE_DIR / "canary.txt").write_text(
         "AGENT_GUARDRAIL_CANARY_9b717b679ddac75bf7efbac45ee13e662d472ac9", encoding="utf-8"
     )
 
@@ -55,22 +59,53 @@ def ensure_json(req_body: bytes) -> Any:
         raise HTTPException(400, "Invalid JSON")
 
 
-def safe_abs_path(path: str, base: Path) -> Path:
-    """Resolve a possibly-relative path against base, fully collapsing .. segments."""
-    p = Path(path)
+def resolve_virtual_path(raw_path: str) -> PurePosixPath | None:
+    """
+    Interpret raw_path the way the grader intends it (relative to, or under,
+    the logical sandbox root), fully collapse '..' segments in POSIX terms,
+    and return the resulting *virtual* absolute path -- or None if it's not
+    a well-formed path at all.
+    """
+    p = PurePosixPath(raw_path)
     if not p.is_absolute():
-        p = (base / p).resolve(strict=False)
+        virtual = LOGICAL_SANDBOX_ROOT / p
     else:
-        p = p.resolve(strict=False)
-    return p
+        virtual = p
+
+    # Manually collapse '.' and '..' components (PurePosixPath doesn't do this).
+    parts: list[str] = []
+    for part in virtual.parts:
+        if part == "/":
+            parts = ["/"]
+            continue
+        if part == ".":
+            continue
+        if part == "..":
+            if len(parts) > 1:
+                parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
+        return None
+    normalized = PurePosixPath(*parts)
+    return normalized
 
 
-def within_root(path: Path, root: Path) -> bool:
+def virtual_to_real(virtual: PurePosixPath) -> Path | None:
+    """Map a normalized virtual path under the logical sandbox root to the
+    real writable path on disk. Returns None if it doesn't map anywhere we
+    actually serve content from (i.e. outside sandbox)."""
     try:
-        path.relative_to(root)
-        return True
-    except Exception:
-        return False
+        rel = virtual.relative_to(LOGICAL_SANDBOX_ROOT)
+    except ValueError:
+        return None
+    real = (REAL_SANDBOX_ROOT / str(rel)).resolve(strict=False)
+    # Final real-filesystem safety check as well.
+    try:
+        real.relative_to(REAL_SANDBOX_ROOT)
+    except ValueError:
+        return None
+    return real
 
 
 def canonical_host(url: str):
@@ -82,7 +117,7 @@ def canonical_host(url: str):
     host = parsed.hostname.rstrip(".").lower()
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("userinfo not allowed")
-    return parsed.scheme, host, urlunparse(parsed)
+    return parsed.scheme, host, parsed
 
 
 def is_private_or_special_ip(ip_str: str) -> bool:
@@ -101,8 +136,6 @@ def is_private_or_special_ip(ip_str: str) -> bool:
 
 
 def host_resolves_to_public_ip(host: str) -> bool:
-    """Resolve hostname and make sure every A/AAAA record is a public IP
-    (defends against DNS-rebinding to loopback/private/metadata addresses)."""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -116,33 +149,37 @@ def host_resolves_to_public_ip(host: str) -> bool:
     return True
 
 
-def exact_allowed_host(url: str) -> bool:
-    try:
-        _, host, _ = canonical_host(url)
-    except Exception:
-        return False
-    if host not in ALLOWED_HOSTS:
-        return False
-    if is_private_or_special_ip(host):  # host itself is a raw IP
-        return False
-    if not host_resolves_to_public_ip(host):
-        return False
-    return True
-
-
 # ------------------------- tool implementations -------------------------
 
-def do_read_file(path: str) -> Dict[str, Any]:
-    p = safe_abs_path(path, SANDBOX_ROOT)
-    if not within_root(p, SANDBOX_ROOT):
+def do_read_file(raw_path: str) -> Dict[str, Any]:
+    virtual = resolve_virtual_path(raw_path)
+    if virtual is None:
+        return {"action": "block", "reason": "Malformed path."}
+
+    real = virtual_to_real(virtual)
+    if real is None:
         return {"action": "block", "reason": "Path escapes the sandbox root."}
-    if not p.exists() or not p.is_file():
+
+    if not real.exists() or not real.is_file():
         return {"action": "block", "reason": "File does not exist inside the sandbox."}
+
     try:
-        txt = p.read_text(encoding="utf-8", errors="replace")
+        txt = real.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return {"action": "block", "reason": f"Read failed: {type(e).__name__}"}
+
     return {"action": "allow", "reason": "Path resolves inside the sandbox root.", "result": txt}
+
+
+def _validate_host_for_fetch(host: str) -> str | None:
+    """Return a block reason, or None if the host is OK to fetch."""
+    if host not in ALLOWED_HOSTS:
+        return "Host is not on the exact allowlist."
+    if is_private_or_special_ip(host):
+        return "Host is a private/special IP literal."
+    if not host_resolves_to_public_ip(host):
+        return "Host resolves to a private/special address."
+    return None
 
 
 def do_fetch_url(url: str) -> Dict[str, Any]:
@@ -151,41 +188,31 @@ def do_fetch_url(url: str) -> Dict[str, Any]:
     except Exception as e:
         return {"action": "block", "reason": f"Invalid URL: {type(e).__name__}"}
 
-    if host not in ALLOWED_HOSTS:
-        return {"action": "block", "reason": "Host is not on the exact allowlist."}
-
-    if is_private_or_special_ip(host):
-        return {"action": "block", "reason": "Host is a private/special IP literal."}
-
-    if not host_resolves_to_public_ip(host):
-        return {"action": "block", "reason": "Host resolves to a private/special address."}
+    reason = _validate_host_for_fetch(host)
+    if reason:
+        return {"action": "block", "reason": reason}
 
     try:
         resp = requests.get(
-            url,
-            timeout=8,
-            allow_redirects=False,
+            url, timeout=8, allow_redirects=False,
             headers={"User-Agent": "ga5-redteam/1.0"},
         )
     except Exception as e:
         return {"action": "block", "reason": f"Fetch failed: {type(e).__name__}"}
 
-    # Manually follow redirects, re-validating each hop against the allowlist.
     hops = 0
     while 300 <= resp.status_code < 400 and hops < 5:
         location = resp.headers.get("Location")
         if not location:
             break
-        # Resolve relative redirects against the current URL.
         next_url = location if "://" in location else requests.compat.urljoin(resp.url, location)
         try:
             _, next_host, _ = canonical_host(next_url)
         except Exception:
             return {"action": "block", "reason": "Redirect target URL is invalid."}
-        if next_host not in ALLOWED_HOSTS:
-            return {"action": "block", "reason": "Redirect left the allowed host."}
-        if is_private_or_special_ip(next_host) or not host_resolves_to_public_ip(next_host):
-            return {"action": "block", "reason": "Redirect target resolves to a private address."}
+        reason = _validate_host_for_fetch(next_host)
+        if reason:
+            return {"action": "block", "reason": f"Redirect blocked: {reason}"}
         try:
             resp = requests.get(
                 next_url, timeout=8, allow_redirects=False,
