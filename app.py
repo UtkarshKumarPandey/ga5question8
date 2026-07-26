@@ -86,7 +86,16 @@ def resolve_virtual_path(raw_path: str) -> Optional[PurePosixPath]:
     if not p.is_absolute():
         virtual = LOGICAL_SANDBOX_ROOT / p
     else:
-        virtual = p
+        sandbox_str = str(LOGICAL_SANDBOX_ROOT)
+        s = str(p)
+        if s == sandbox_str or s.startswith(sandbox_str + "/"):
+            # Already fully-qualified under the logical sandbox root.
+            virtual = p
+        else:
+            # Chroot-style: re-root the absolute path under the sandbox
+            # instead of treating "/" as the real filesystem root.
+            rest = p.parts[1:]  # drop the leading "/"
+            virtual = LOGICAL_SANDBOX_ROOT.joinpath(*rest) if rest else LOGICAL_SANDBOX_ROOT
 
     parts: list[str] = []
     for part in virtual.parts:
