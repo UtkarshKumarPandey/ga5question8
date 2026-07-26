@@ -117,6 +117,14 @@ def canonical_host(url: str):
     host = parsed.hostname.rstrip(".").lower()
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("userinfo not allowed")
+    # Reject IP-literal hosts outright — allowed hosts are always domain names.
+    try:
+        ipaddress.ip_address(host)
+        raise ValueError("IP literal hosts are not allowed")
+    except ValueError as e:
+        if "IP literal" in str(e):
+            raise
+        # not an IP address string — fine, continue
     return parsed.scheme, host, parsed
 
 
